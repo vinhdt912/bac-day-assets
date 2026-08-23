@@ -8,7 +8,10 @@ Excel `bac_day_vocab_data.xlsx` — Sheet1, cột:
   - video_url    : URL công khai của video
   - upload_time  : tự ghi sau khi đăng thành công (để bỏ qua bài đã đăng)
 
-Ưu tiên media: image_url > video_url > TEXT thuần.
+Sheet `info`:
+  - time_break   : số phút chờ giữa 2 bài (thay CONST_TIME_SLEEP)
+
+Media: cả ảnh + video → CAROUSEL; chỉ ảnh → IMAGE; chỉ video → VIDEO; không media → TEXT.
 """
 
 import os
@@ -19,13 +22,16 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
-CONST_MAX_POST = 15
-CONST_TIME_SLEEP = 60  # phút — mỗi bài cách nhau 1 tiếng
-SESSION_START_HOUR = 9
-SESSION_END_HOUR = 0
-POST_BUFFER_SECONDS = 180
+CONST_MAX_POST = 15 # số bài đăng tối đa trong một phiên
+DEFAULT_TIME_SLEEP = 60  # phút — fallback nếu sheet info thiếu time_break
+SESSION_START_HOUR = 9 # thời gian bắt đầu đăng bài
+SESSION_END_HOUR = 0 # thời gian kết thúc đăng bài
+POST_BUFFER_SECONDS = 180 # thời gian buffer sau khi đăng bài để tránh lỗi
 
 REQUIRED_COLUMNS = ("content", "sub_content", "image_url", "video_url")
+THREADS_API_BASE = "https://graph.threads.net/v1.0"
+CONTAINER_WAIT_TIMEOUT = 300 # thời gian chờ container xử lý xong (cần cho VIDEO / CAROUSEL)
+CONTAINER_POLL_INTERVAL = 15 # thời gian polling container xử lý xong (cần cho VIDEO / CAROUSEL)
 
 
 def _is_blank(value):
@@ -109,6 +115,38 @@ def load_vocab_df(file_path):
     return df
 
 
+def load_time_break(file_path):
+    """Đọc time_break (phút) từ sheet info. Fallback DEFAULT_TIME_SLEEP nếu thiếu."""
+    try:
+        info_df = pd.read_excel(file_path, sheet_name="info")
+    except Exception as exc:
+        print(
+            f"Không đọc được sheet info, dùng mặc định "
+            f"{DEFAULT_TIME_SLEEP} phút: {exc}"
+        )
+        return DEFAULT_TIME_SLEEP
+
+    if "time_break" not in info_df.columns or info_df.empty:
+        print(
+            f"Sheet info thiếu time_break, dùng mặc định "
+            f"{DEFAULT_TIME_SLEEP} phút."
+        )
+        return DEFAULT_TIME_SLEEP
+
+    value = info_df["time_break"].iloc[0]
+    try:
+        minutes = int(float(value))
+        if minutes <= 0:
+            raise ValueError("time_break phải > 0")
+        return minutes
+    except (TypeError, ValueError):
+        print(
+            f"time_break không hợp lệ ({value}), dùng mặc định "
+            f"{DEFAULT_TIME_SLEEP} phút."
+        )
+        return DEFAULT_TIME_SLEEP
+
+
 def save_vocab_df(df, file_path):
     with pd.ExcelWriter(
         file_path, engine="openpyxl", mode="a", if_sheet_exists="overlay"
@@ -128,24 +166,141 @@ def can_post_more(session_end, posted_count):
     return datetime.now() < session_end
 
 
-def sleep_between_posts(session_end):
+def sleep_between_posts(session_end, file_path):
     remaining = seconds_until_session_end(session_end) - POST_BUFFER_SECONDS
     if remaining <= 0:
         return
-    time_sleep = min(CONST_TIME_SLEEP * 60, remaining)
+    time_break = load_time_break(file_path)
+    time_sleep = min(time_break * 60, remaining)
     print(f"Đang đợi {time_sleep / 60:.0f} phút trước bài tiếp theo...")
     time.sleep(time_sleep)
 
 
 def resolve_media(image_url=None, video_url=None):
-    """Trả về (media_type, media_url). Ưu tiên ảnh > video > text."""
+    """Trả về (media_type, image_url, video_url). Cả hai URL → CAROUSEL."""
     image_url = _clean_str(image_url)
     video_url = _clean_str(video_url)
+    if image_url and video_url:
+        return "CAROUSEL", image_url, video_url
     if image_url:
-        return "IMAGE", image_url
+        return "IMAGE", image_url, None
     if video_url:
-        return "VIDEO", video_url
-    return "TEXT", None
+        return "VIDEO", None, video_url
+    return "TEXT", None, None
+
+
+def create_threads_container(user_id, payload):
+    url = f"{THREADS_API_BASE}/{user_id}/threads"
+    response = requests.post(url, data=payload)
+    data = response.json()
+    if "id" not in data:
+        print(f"Lỗi tạo container: {data}")
+        return None
+    creation_id = data["id"]
+    print(f"  -> Đã tạo container. Creation ID: {creation_id}")
+    return creation_id
+
+
+def wait_for_container_ready(container_id, access_token):
+    """Chờ container xử lý xong (cần cho VIDEO / CAROUSEL)."""
+    url = f"{THREADS_API_BASE}/{container_id}"
+    deadline = time.time() + CONTAINER_WAIT_TIMEOUT
+    last_status = None
+    while time.time() < deadline:
+        response = requests.get(
+            url,
+            params={
+                "fields": "status,error_message",
+                "access_token": access_token,
+            },
+        )
+        data = response.json()
+        status = data.get("status")
+        last_status = status
+        if status == "FINISHED":
+            print(f"  -> Container {container_id} sẵn sàng (FINISHED).")
+            return True
+        if status in ("ERROR", "EXPIRED"):
+            print(f"Lỗi container {container_id}: {data}")
+            return False
+        print(f"  -> Container {container_id} đang xử lý ({status})...")
+        time.sleep(CONTAINER_POLL_INTERVAL)
+    print(f"Lỗi: hết thời gian chờ container {container_id} (status={last_status}).")
+    return False
+
+
+def publish_threads_container(user_id, creation_id, access_token):
+    url = f"{THREADS_API_BASE}/{user_id}/threads_publish"
+    response = requests.post(
+        url,
+        data={"creation_id": creation_id, "access_token": access_token},
+    )
+    data = response.json()
+    if "id" in data:
+        published_id = data["id"]
+        print(f"  -> Publish THÀNH CÔNG! Post ID: {published_id}")
+        return published_id
+    print(f"Lỗi publish: {data}")
+    return None
+
+
+def post_carousel(
+    text,
+    image_url,
+    video_url,
+    reply_to_id=None,
+    user_id=None,
+    access_token=None,
+):
+    """Đăng 1 bài carousel: ảnh + video (Threads yêu cầu tối thiểu 2 media)."""
+    print(f"  -> media_type=CAROUSEL, image={image_url}, video={video_url}")
+
+    image_id = create_threads_container(
+        user_id,
+        {
+            "media_type": "IMAGE",
+            "image_url": image_url,
+            "is_carousel_item": "true",
+            "access_token": access_token,
+        },
+    )
+    if not image_id:
+        return None
+
+    video_id = create_threads_container(
+        user_id,
+        {
+            "media_type": "VIDEO",
+            "video_url": video_url,
+            "is_carousel_item": "true",
+            "access_token": access_token,
+        },
+    )
+    if not video_id:
+        return None
+
+    if not wait_for_container_ready(image_id, access_token):
+        return None
+    if not wait_for_container_ready(video_id, access_token):
+        return None
+
+    carousel_payload = {
+        "media_type": "CAROUSEL",
+        "children": f"{image_id},{video_id}",
+        "access_token": access_token,
+    }
+    if text:
+        carousel_payload["text"] = text
+    if reply_to_id:
+        carousel_payload["reply_to_id"] = reply_to_id
+
+    carousel_id = create_threads_container(user_id, carousel_payload)
+    if not carousel_id:
+        return None
+    if not wait_for_container_ready(carousel_id, access_token):
+        return None
+
+    return publish_threads_container(user_id, carousel_id, access_token)
 
 
 def post_to_threads(
@@ -156,58 +311,49 @@ def post_to_threads(
     image_url=None,
     video_url=None,
 ):
-    media_type, media_url = resolve_media(image_url, video_url)
-    url_create = f"https://graph.threads.net/v1.0/{user_id}/threads"
+    media_type, image_url, video_url = resolve_media(image_url, video_url)
+    text = _clean_str(text)
+
+    if media_type == "TEXT" and not text:
+        print("Lỗi: bài TEXT cần có nội dung.")
+        return None
+
+    if media_type == "CAROUSEL":
+        return post_carousel(
+            text,
+            image_url,
+            video_url,
+            reply_to_id=reply_to_id,
+            user_id=user_id,
+            access_token=access_token,
+        )
+
     payload_create = {
         "media_type": media_type,
         "access_token": access_token,
     }
-
-    text = _clean_str(text)
     if text:
         payload_create["text"] = text
-    elif media_type == "TEXT":
-        print("Lỗi: bài TEXT cần có nội dung.")
-        return None
-
     if media_type == "IMAGE":
-        payload_create["image_url"] = media_url
+        payload_create["image_url"] = image_url
     elif media_type == "VIDEO":
-        payload_create["video_url"] = media_url
-
+        payload_create["video_url"] = video_url
     if reply_to_id:
         payload_create["reply_to_id"] = reply_to_id
 
+    media_url = image_url or video_url
     print(f"  -> media_type={media_type}" + (f", url={media_url}" if media_url else ""))
-    response_create = requests.post(url_create, data=payload_create)
-    data_create = response_create.json()
-
-    if "id" not in data_create:
-        print(f"Lỗi tạo container: {data_create}")
+    creation_id = create_threads_container(user_id, payload_create)
+    if not creation_id:
         return None
 
-    creation_id = data_create["id"]
-    print(f"  -> Đã tạo container. Creation ID: {creation_id}")
+    if media_type == "VIDEO":
+        if not wait_for_container_ready(creation_id, access_token):
+            return None
+    else:
+        time.sleep(5)
 
-    # Video cần thời gian xử lý lâu hơn ảnh/text
-    wait_seconds = 30 if media_type == "VIDEO" else 5
-    time.sleep(wait_seconds)
-
-    url_publish = f"https://graph.threads.net/v1.0/{user_id}/threads_publish"
-    payload_publish = {
-        "creation_id": creation_id,
-        "access_token": access_token,
-    }
-    response_publish = requests.post(url_publish, data=payload_publish)
-    data_publish = response_publish.json()
-
-    if "id" in data_publish:
-        published_id = data_publish["id"]
-        print(f"  -> Publish THÀNH CÔNG! Post ID: {published_id}")
-        return published_id
-
-    print(f"Lỗi publish: {data_publish}")
-    return None
+    return publish_threads_container(user_id, creation_id, access_token)
 
 
 def post_content_chain(df_origin, row_idx, user_id, access_token):
@@ -282,7 +428,7 @@ def run_posting_session(file_path, user_id, access_token, session_start, session
         if not can_post_more(session_end, len(df_filtered)):
             break
 
-        sleep_between_posts(session_end)
+        sleep_between_posts(session_end, file_path)
 
 
 def run_daily_cycle(file_path, user_id, access_token):
@@ -307,8 +453,8 @@ def run_daily_cycle(file_path, user_id, access_token):
 
 if __name__ == "__main__":
     load_dotenv(
-        r"C:\Users\vinhdt912\Documents\Projects\add_anki_with_gemini_draft"
-        r"\add_anki_with_gemini\.env"
+        r"C:\Users\vinhdt912\Documents\thuy_onedrive\OneDrive\Giáo Ngọng Businesss"
+        r"\Tools\Threads\bac_day\bac-day-assets\.env"
     )
 
     user_id = os.getenv("USER_ID", "me")
@@ -318,7 +464,10 @@ if __name__ == "__main__":
             "Thiếu LONG_LIVED_TOKEN trong .env — hãy thay bằng token thật."
         )
 
-    file_path = r"C:\Users\vinhdt912\Documents\thuy_onedrive\OneDrive\Giáo Ngọng Businesss\Tools\Threads\bac_day\vocab_data.xlsx"
+    file_path = (
+        r"C:\Users\vinhdt912\Documents\thuy_onedrive\OneDrive\Giáo Ngọng Businesss"
+        r"\Tools\Threads\bac_day\vocab_data.xlsx"
+    )
 
     print(load_vocab_df(file_path).head())
     run_daily_cycle(file_path, user_id, access_token)
