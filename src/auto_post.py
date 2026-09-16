@@ -453,8 +453,7 @@ def run_daily_cycle(file_path, user_id, access_token):
 
 if __name__ == "__main__":
     load_dotenv(
-        r"C:\Users\vinhdt912\Documents\thuy_onedrive\OneDrive\Giáo Ngọng Businesss"
-        r"\Tools\Threads\bac_day\bac-day-assets\.env"
+        r"C:\Users\vinhdt912\Documents\thuy_onedrive\OneDrive\Tools\Threads\bac_day\bac-day-assets\.env"
     )
 
     user_id = os.getenv("USER_ID", "me")
@@ -465,8 +464,7 @@ if __name__ == "__main__":
         )
 
     file_path = (
-        r"C:\Users\vinhdt912\Documents\thuy_onedrive\OneDrive\Giáo Ngọng Businesss"
-        r"\Tools\Threads\bac_day\vocab_data.xlsx"
+        r"C:\Users\vinhdt912\Documents\thuy_onedrive\OneDrive\Tools\Threads\bac_day\vocab_data.xlsx"
     )
 
     print(load_vocab_df(file_path).head())
