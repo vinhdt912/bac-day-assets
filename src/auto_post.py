@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 import requests
+import random
 from dotenv import load_dotenv
 
 CONST_MAX_POST = 15 # số bài đăng tối đa trong một phiên
@@ -171,7 +172,8 @@ def sleep_between_posts(session_end, file_path):
     if remaining <= 0:
         return
     time_break = load_time_break(file_path)
-    time_sleep = min(time_break * 60, remaining)
+    random_time_break = random.randint(time_break - 10, time_break + 10) * 60
+    time_sleep = min(random_time_break, remaining)
     print(f"Đang đợi {time_sleep / 60:.0f} phút trước bài tiếp theo...")
     time.sleep(time_sleep)
 
